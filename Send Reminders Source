@@ -1,0 +1,119 @@
+// Checks current time against Supplements & Habits (live from the Sheet)
+// and a fixed water-reminder schedule, and sends any due OneSignal push.
+// Triggered externally every 5 minutes by a free cron service (cron-job.org),
+// since this site has no scheduling of its own configured.
+
+const SHEET_API_URL = 'https://script.google.com/macros/s/AKfycby77opys9Jn6QWl2y__KQjD3319Q6wmAQliuIpUUNpcQfDkm1ZL48PpoLVN0fqig4wKXA/exec';
+const TIMEZONE = 'America/New_York'; // Ohio
+
+// Water isn't a timed row in the Sheet, so these four times are fixed here.
+const WATER_REMINDERS = [
+  { hour: 10, minute: 0, body: "Time for some water 💧" },
+  { hour: 13, minute: 0, body: "Water check-in — top up if you're behind 💧" },
+  { hour: 15, minute: 0, body: "Afternoon water reminder 💧" },
+  { hour: 18, minute: 0, body: "Evening water reminder 💧" },
+];
+
+function nowInTimezone() {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: TIMEZONE, hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(new Date());
+  return {
+    hour: Number(parts.find(p => p.type === 'hour').value),
+    minute: Number(parts.find(p => p.type === 'minute').value),
+  };
+}
+
+function parseTimeString(str) {
+  const m = String(str || '').match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+  if (!m) return null;
+  let hour = Number(m[1]);
+  const minute = Number(m[2]);
+  const ampm = m[3].toUpperCase();
+  if (ampm === 'PM' && hour !== 12) hour += 12;
+  if (ampm === 'AM' && hour === 12) hour = 0;
+  return { hour, minute };
+}
+
+// Same grouping logic as the app itself uses, so reminders match what
+// you see under Supplements & Habits (one push per time-block, not per pill).
+function timingBucket(row) {
+  const t = String(row.time || '');
+  const item = String(row.item || '').toLowerCase();
+  const category = String(row.category || '').toLowerCase();
+  if (/8:00|8:30/.test(t) && category === 'medication') return '8:00 AM Medication';
+  if (/11:00/.test(t) && category === 'medication') return '11:00 PM Medication';
+  if (/dinner/i.test(t)) return 'Dinner';
+  if (/evening/i.test(t)) return 'Evening';
+  if (/midday|afternoon|flexible/i.test(t) || /probiotic|fiber/.test(item)) return 'Midday';
+  if (/breakfast|9:00/.test(t)) return 'Breakfast';
+  if (/smoothie|morning/i.test(t)) return 'Morning smoothie';
+  return null; // unrecognized timing — skip rather than guess
+}
+
+async function sendPush(title, body) {
+  const res = await fetch('https://api.onesignal.com/notifications', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Key ${process.env.ONESIGNAL_API_KEY}`,
+    },
+    body: JSON.stringify({
+      app_id: process.env.ONESIGNAL_APP_ID,
+      included_segments: ['Subscribed Users'],
+      headings: { en: title },
+      contents: { en: body },
+    }),
+  });
+  if (!res.ok) {
+    console.error('OneSignal send failed', res.status, await res.text());
+  }
+}
+
+exports.handler = async () => {
+  const { hour, minute } = nowInTimezone();
+  const dueMessages = [];
+
+  // Water — fixed times
+  for (const w of WATER_REMINDERS) {
+    if (w.hour === hour && Math.abs(w.minute - minute) < 5) {
+      dueMessages.push({ title: 'Water reminder', body: w.body });
+    }
+  }
+
+  // Supplements & Habits — live from the Sheet
+  try {
+    const res = await fetch(`${SHEET_API_URL}?t=${Date.now()}`, { cache: 'no-store' });
+    const payload = await res.json();
+    if (payload && payload.success && Array.isArray(payload.supplementsAndHabits)) {
+      const relevant = payload.supplementsAndHabits.filter(r => {
+        const c = String(r.category || '').toLowerCase();
+        return ['supplements', 'medication', 'nutrition', 'wellness'].includes(c);
+      });
+      const groups = {};
+      relevant.forEach(r => {
+        const bucket = timingBucket(r);
+        if (!bucket) return;
+        (groups[bucket] = groups[bucket] || []).push(r);
+      });
+      for (const [bucket, items] of Object.entries(groups)) {
+        const time = parseTimeString(items[0].time);
+        if (!time) continue;
+        if (time.hour === hour && Math.abs(time.minute - minute) < 5) {
+          dueMessages.push({ title: bucket, body: items.map(i => i.item).join(', ') });
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Failed to read Sheet data', err);
+  }
+
+  for (const msg of dueMessages) {
+    await sendPush(msg.title, msg.body);
+  }
+
+  return {
+    statusCode: 200,
+    body: JSON.stringify({ checkedAt: `${hour}:${String(minute).padStart(2, '0')} ET`, sent: dueMessages.length }),
+  };
+};
